@@ -239,31 +239,37 @@ def train(hyp, opt, device, tb_writer=None):
     model.class_weights = labels_to_class_weights(dataset.labels, nc).to(device) * nc  # attach class weights
     model.names = names
 
-    qat = False
     # SparseML Integration
     if not opt.use_leaky_relu:  # use LeakyReLU activations
         model = replace_activations(model, 'lrelu', inplace=True)
 
-    manager = ScheduledModifierManager.from_yaml(opt.sparseml_recipe)
-    optimizer = ScheduledOptimizer(
-        optimizer,
-        model if not is_parallel(model) else model.module,
-        manager,
-        steps_per_epoch=len(dataloader),
-        loggers=[PythonLogger(), TensorBoardLogger(writer=tb_writer)]
-    )
-    # override lr scheduler if recipe makes any LR updates
-    if manager.learning_rate_modifiers:
-        logger.info('Disabling yolo LR scheduler, managing LR using SparseML recipe')
-        scheduler = None
-    # override num epochs if recipe explicitly modifies epoch range
-    if manager.epoch_modifiers and manager.max_epochs:
-        epochs = manager.max_epochs or epochs  # override num_epochs
-        logger.info(f'overriding number of epochs from SparseML manager to {manager.max_epochs}')
-    # mark that QAT will be applied, pickled QAT exports currently not supported
-    if manager.quantization_modifiers:
-        logger.info('Disabling pickling for model exports, QAT scheduled to run')
-        qat = True
+    qat = False
+    if opt.sparseml_recipe:
+        manager = ScheduledModifierManager.from_yaml(opt.sparseml_recipe)
+        optimizer = ScheduledOptimizer(
+            optimizer,
+            model if not is_parallel(model) else model.module,
+            manager,
+            steps_per_epoch=len(dataloader),
+            loggers=[PythonLogger(), TensorBoardLogger(writer=tb_writer)]
+        )
+        # override lr scheduler if recipe makes any LR updates
+        if manager.learning_rate_modifiers:
+            logger.info('Disabling LR scheduler, managing LR using SparseML recipe')
+            scheduler = None
+        # override num epochs if recipe explicitly modifies epoch range
+        if manager.epoch_modifiers and manager.max_epochs:
+            epochs = manager.max_epochs or epochs  # override num_epochs
+            logger.info(f'Overriding number of epochs from SparseML manager to {manager.max_epochs}')
+        # mark that QAT will be applied, pickled QAT exports currently not supported
+        if manager.quantization_modifiers:
+            logger.info('Disabling pickling for model exports, QAT scheduled to run')
+            if not opt.use_leaky_relu:
+                logger.warning(
+                    'QAT detected in sparsification recipe, but --use-leaky-relu not set '
+                    'quantized model may not run well with default activations'
+                )
+            qat = True
 
     # Start training
     t0 = time.time()
@@ -479,14 +485,17 @@ def train(hyp, opt, device, tb_writer=None):
 
         # ONNX export
         if opt.export_onnx:
-            onnx_path = f'{save_dir}/model.onnx'
-            logger.info(f'training complete, exporting ONNX to {onnx_path}')
-            export_model = model.module if is_parallel_model(model) else model
-            export_model.model[-1].export = True  # do not export grid post-procesing
-            exporter = ModuleExporter(export_model, save_dir)
-            exporter.export_onnx(torch.randn(1, 3, imgsz, imgsz), convert_qat=True)
-            if qat:
-                skip_onnx_input_quantize(onnx_path, onnx_path)
+            try:
+                onnx_path = f'{save_dir}/model.onnx'
+                logger.info(f'training complete, exporting ONNX to {onnx_path}')
+                export_model = model.module if is_parallel_model(model) else model
+                export_model.model[-1].export = True  # do not export grid post-procesing
+                exporter = ModuleExporter(export_model, save_dir)
+                exporter.export_onnx(torch.randn(1, 3, imgsz, imgsz), convert_qat=True)
+                if qat:
+                    skip_onnx_input_quantize(onnx_path, onnx_path)
+            except Exception as e:
+                logger.warning(f'exception occured during ONNX export, model not exported to ONNX. error message {e}')
 
         # Strip optimizers
         final = best if best.exists() else last  # final model
