@@ -21,6 +21,11 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
+from sparseml.pytorch.nn import replace_activations
+from sparseml.pytorch.optim import ScheduledModifierManager, ScheduledOptimizer
+from sparseml.pytorch.utils import PythonLogger, TensorBoardLogger, ModuleExporter
+from sparseml.pytorch.utils import ModuleExporter
+
 import test  # import test.py to get mAP after each epoch
 from models.experimental import attempt_load
 from models.yolo import Model
@@ -233,13 +238,35 @@ def train(hyp, opt, device, tb_writer=None):
     model.class_weights = labels_to_class_weights(dataset.labels, nc).to(device) * nc  # attach class weights
     model.names = names
 
+    # SparseML Integration
+    if not opt.use_leaky_relu:  # use LeakyReLU activations
+        model = replace_activations(model, 'lrelu', inplace=True)
+
+    manager = ScheduledModifierManager.from_yaml(opt.sparseml_recipe)
+    optimizer = ScheduledOptimizer(
+        optimizer,
+        model if not is_parallel(model) else model.module,
+        manager,
+        steps_per_epoch=len(dataloader),
+        loggers=[PythonLogger(), TensorBoardLogger(writer=tb_writer)]
+    )
+    # override lr scheduler if recipe makes any LR updates
+    if manager.learning_rate_modifiers:
+        logger.info('Disabling yolo LR scheduler, managing LR using SparseML recipe')
+        scheduler = None
+    # override num epochs if recipe explicitly modifies epoch range
+    if manager.epoch_modifiers and manager.max_epochs:
+        epochs = manager.max_epochs or epochs  # override num_epochs
+        logger.info(f'overriding number of epochs from SparseML manager to {manager.max_epochs}')
+
     # Start training
     t0 = time.time()
     nw = max(round(hyp['warmup_epochs'] * nb), 1000)  # number of warmup iterations, max(3 epochs, 1k iterations)
     # nw = min(nw, (epochs - start_epoch) / 2 * nb)  # limit warmup to < 1/2 of training
     maps = np.zeros(nc)  # mAP per class
     results = (0, 0, 0, 0, 0, 0, 0)  # P, R, mAP@.5, mAP@.5-.95, val_loss(box, obj, cls)
-    scheduler.last_epoch = start_epoch - 1  # do not move
+    if scheduler:
+        scheduler.last_epoch = start_epoch - 1  # do not move
     scaler = amp.GradScaler(enabled=cuda)
     compute_loss = ComputeLoss(model)  # init loss class
     logger.info(f'Image sizes {imgsz} train, {imgsz_test} test\n'
@@ -286,7 +313,8 @@ def train(hyp, opt, device, tb_writer=None):
                 accumulate = max(1, np.interp(ni, xi, [1, nbs / total_batch_size]).round())
                 for j, x in enumerate(optimizer.param_groups):
                     # bias lr falls from 0.1 to lr0, all other lrs rise from 0.0 to lr0
-                    x['lr'] = np.interp(ni, xi, [hyp['warmup_bias_lr'] if j == 2 else 0.0, x['initial_lr'] * lf(epoch)])
+                    if scheduler:
+                        x['lr'] = np.interp(ni, xi, [hyp['warmup_bias_lr'] if j == 2 else 0.0, x['initial_lr'] * lf(epoch)])
                     if 'momentum' in x:
                         x['momentum'] = np.interp(ni, xi, [hyp['warmup_momentum'], hyp['momentum']])
 
@@ -342,7 +370,8 @@ def train(hyp, opt, device, tb_writer=None):
 
         # Scheduler
         lr = [x['lr'] for x in optimizer.param_groups]  # for tensorboard
-        scheduler.step()
+        if scheduler:
+            scheduler.step()
 
         # DDP process 0 or single-GPU
         if rank in [-1, 0]:
@@ -435,6 +464,15 @@ def train(hyp, opt, device, tb_writer=None):
                                           plots=False,
                                           is_coco=is_coco)
 
+        # ONNX export
+        if opt.export_onnx:
+            onnx_path = f'{save_dir}/model.onnx'
+            logger.info(f'training complete, exporting ONNX to {onnx_path}')
+            export_model = model.module if is_parallel_model(model) else model
+            export_model.model[-1].export = True  # do not export grid post-procesing
+            exporter = ModuleExporter(export_model, save_dir)
+            exporter.export_onnx(torch.randn(1, 3, imgsz, imgsz), convert_qat=True)
+
         # Strip optimizers
         final = best if best.exists() else last  # final model
         for f in last, best:
@@ -489,6 +527,9 @@ if __name__ == '__main__':
     parser.add_argument('--bbox_interval', type=int, default=-1, help='Set bounding-box image logging interval for W&B')
     parser.add_argument('--save_period', type=int, default=-1, help='Log model after every "save_period" epoch')
     parser.add_argument('--artifact_alias', type=str, default="latest", help='version of dataset artifact to be used')
+    parser.add_argument('--sparseml-recipe', type=str, default=None, help='Path to a SparseML sparsification recipe, see <TODO: Link Here> for more information')
+    parser.add_argument('--use-leaky-relu', action='store_true', help='Override default SiLU activation with LeakyReLU')
+    parser.add_argument('--export_onnx', action='store_true', help='export final model to ONNX')
     opt = parser.parse_args()
 
     # Set DDP variables
