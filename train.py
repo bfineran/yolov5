@@ -24,7 +24,7 @@ from tqdm import tqdm
 from sparseml.pytorch.nn import replace_activations
 from sparseml.pytorch.optim import ScheduledModifierManager, ScheduledOptimizer
 from sparseml.pytorch.utils import PythonLogger, TensorBoardLogger, ModuleExporter
-from sparseml.pytorch.utils import ModuleExporter
+from sparseml.pytorch.utils.quantization import skip_onnx_input_quantize
 
 import test  # import test.py to get mAP after each epoch
 from models.experimental import attempt_load
@@ -239,6 +239,7 @@ def train(hyp, opt, device, tb_writer=None):
     model.class_weights = labels_to_class_weights(dataset.labels, nc).to(device) * nc  # attach class weights
     model.names = names
 
+    qat = False
     # SparseML Integration
     if not opt.use_leaky_relu:  # use LeakyReLU activations
         model = replace_activations(model, 'lrelu', inplace=True)
@@ -259,6 +260,10 @@ def train(hyp, opt, device, tb_writer=None):
     if manager.epoch_modifiers and manager.max_epochs:
         epochs = manager.max_epochs or epochs  # override num_epochs
         logger.info(f'overriding number of epochs from SparseML manager to {manager.max_epochs}')
+    # mark that QAT will be applied, pickled QAT exports currently not supported
+    if manager.quantization_modifiers:
+        logger.info('Disabling pickling for model exports, QAT scheduled to run')
+        qat = True
 
     # Start training
     t0 = time.time()
@@ -422,6 +427,8 @@ def train(hyp, opt, device, tb_writer=None):
             # Save model
             if (not opt.nosave) or (final_epoch and not opt.evolve):  # if save
                 ckpt_model = deepcopy(model.module if is_parallel(model) else model)
+                if qat:
+                    ckpt_model = model.state_dict()  # pickled QAT exports not currently supported
                 ckpt = {'epoch': epoch,
                         'best_fitness': best_fitness,
                         'training_results': results_file.read_text(),
@@ -455,7 +462,7 @@ def train(hyp, opt, device, tb_writer=None):
         logger.info('%g epochs completed in %.3f hours.\n' % (epoch - start_epoch + 1, (time.time() - t0) / 3600))
         if opt.data.endswith('coco.yaml') and nc == 80:  # if COCO
             for m in (last, best) if best.exists() else (last):  # speed, mAP tests
-                test_model = attempt_load(m, device)
+                test_model = attempt_load(m, device) if not qat else model
                 results, _, _ = test.test(opt.data,
                                           batch_size=batch_size * 2,
                                           imgsz=imgsz_test,
@@ -478,11 +485,13 @@ def train(hyp, opt, device, tb_writer=None):
             export_model.model[-1].export = True  # do not export grid post-procesing
             exporter = ModuleExporter(export_model, save_dir)
             exporter.export_onnx(torch.randn(1, 3, imgsz, imgsz), convert_qat=True)
+            if qat:
+                skip_onnx_input_quantize(onnx_path, onnx_path)
 
         # Strip optimizers
         final = best if best.exists() else last  # final model
         for f in last, best:
-            if f.exists():
+            if f.exists() and not qat:  # qat state dict incompatible
                 strip_optimizer(f)  # strip optimizers
         if opt.bucket:
             os.system(f'gsutil cp {final} gs://{opt.bucket}/weights')  # upload
@@ -535,7 +544,7 @@ if __name__ == '__main__':
     parser.add_argument('--artifact_alias', type=str, default="latest", help='version of dataset artifact to be used')
     parser.add_argument('--sparseml-recipe', type=str, default=None, help='Path to a SparseML sparsification recipe, see <TODO: Link Here> for more information')
     parser.add_argument('--use-leaky-relu', action='store_true', help='Override default SiLU activation with LeakyReLU')
-    parser.add_argument('--export_onnx', action='store_true', help='export final model to ONNX')
+    parser.add_argument('--export-onnx', action='store_true', help='export final model to ONNX')
     parser.add_argument('--disable-amp', action='store_true', help='Disable FP16 half precision (enabled by default)')
     parser.add_argument('--disable-ema', action='store_true', help='Disable EMA model updates (enabled by default)')
     opt = parser.parse_args()
